@@ -784,8 +784,11 @@ function doLogout(){
 //  DATA LOADERS
 // ══════════════════════════════════════════════════════════════
 async function loadLocs(){
+  const cached=sessionStorage.getItem('cv_locs');
+  if(cached){ try{ DB.locations=JSON.parse(cached); return; }catch(e){} }
   const data=await gsGet({action:'locations'});
   DB.locations=Array.isArray(data)?data:[];
+  try{ sessionStorage.setItem('cv_locs',JSON.stringify(DB.locations)); }catch(e){}
 }
 async function loadRecords(){
   const p={action:'records'};
@@ -798,11 +801,15 @@ async function loadUsers(){
   DB.users=Array.isArray(data)?data:[];
 }
 async function loadAwbToday(){
+  const key='cv_awb_'+todayStr();
+  const cached=sessionStorage.getItem(key);
+  if(cached){ try{ DB.awbMaster=JSON.parse(cached); return; }catch(e){} }
   const data=await gsGet({action:'awb'});
   DB.awbMaster={};
   if(Array.isArray(data)) data.forEach(r=>{
     DB.awbMaster[(r.awb||'').toUpperCase()]={productName:r.product_name,category:r.product_category};
   });
+  try{ sessionStorage.setItem(key,JSON.stringify(DB.awbMaster)); }catch(e){}
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -904,7 +911,7 @@ async function uploadImagesBackground(awb, recId, imgs){
     }
     // Update record with image URLs
     const r=DB.records.find(x=>x.id===recId);
-    if(r){ r.label_image_url=urls[0]; r.front_image_url=urls[1]; r.back_image_url=urls[2]; }
+    if(r){ r.label_image_url=urls[0]; r.front_image_url=urls[1]; r.back_image_url=urls[2]; r.xray_image_url=urls[0]||urls[1]||urls[2]; r.image_linked=true; }
     toast('Images uploaded for '+awb,'ok');
   }catch(e){ console.warn('Image upload error:',e.message); }
   window._uploading = Math.max(0,(window._uploading||1)-1);
@@ -1068,7 +1075,12 @@ function parseImageFilename(filename){
   let awb=null, timestamp=null;
   const parts=name.split(/[_\-]/);
   for(const part of parts){
+    // Standard AWB: optional letters, then digits, optional letters (BLR/GWT/NCRT)
     if(/^[A-Z]{0,4}\d{7,15}[A-Z]{0,3}$/i.test(part)&&part.length>=8&&!/^\d{8}$/.test(part)&&!/^\d{6}$/.test(part)){
+      awb=part.toUpperCase(); break;
+    }
+    // KOT format: digits followed by letters e.g. 0200000A, 0100000A
+    if(/^\d{5,15}[A-Z]{1,4}$/i.test(part)&&part.length>=6&&!/^\d{8}$/.test(part)){
       awb=part.toUpperCase(); break;
     }
   }
@@ -1128,22 +1140,24 @@ async function applyFolder(){
   if(!matches.length){toast('No matches','err');return;}
   showLoad('Uploading 0/'+matches.length+'...');
   const linked=[];
-  for(let i=0;i<matches.length;i++){
-    document.getElementById('loadingMsg').textContent='Uploading '+(i+1)+'/'+matches.length+'...';
-    const m=matches[i];
-    try{
-      // Convert BMP to JPEG first
-      let blob;
-      if(m.file){ const d=await readFile(m.file); blob=await(await fetch(d)).blob(); }
-      else blob=await(await fetch(m.data)).blob();
-      const b64=await blobToB64(blob);
-      const fn=todayStr().replace(/-/g,'')+'_'+m.rec.awb+'_xray.jpg';
-      const res=await gsPost({action:'uploadImageDrive',fileName:fn,base64:b64,mimeType:'image/jpeg',location:myLoc(),awb:m.rec.awb});
-      if(res?.url){
-        const r=DB.records.find(x=>x.id===m.rec.id);
-        if(r){r.xray_image_url=res.url;r.image_linked=true;linked.push(r);}
-      }
-    }catch(err){ console.warn('Upload error:',err.message); }
+  const BATCH=5;
+  for(let i=0;i<matches.length;i+=BATCH){
+    const batch=matches.slice(i,i+BATCH);
+    document.getElementById('loadingMsg').textContent='Uploading '+(Math.min(i+BATCH,matches.length))+'/'+matches.length+'...';
+    await Promise.all(batch.map(async m=>{
+      try{
+        let blob;
+        if(m.file){ const d=await readFile(m.file); blob=await(await fetch(d)).blob(); }
+        else blob=await(await fetch(m.data)).blob();
+        const b64=await blobToB64(blob);
+        const fn=todayStr().replace(/-/g,'')+'_'+m.rec.awb+'_xray.jpg';
+        const res=await gsPost({action:'uploadImageDrive',fileName:fn,base64:b64,mimeType:'image/jpeg',location:myLoc(),awb:m.rec.awb});
+        if(res?.url){
+          const r=DB.records.find(x=>x.id===m.rec.id);
+          if(r){r.xray_image_url=res.url;r.image_linked=true;linked.push(r);}
+        }
+      }catch(err){ console.warn('Upload error:',err.message); }
+    }));
   }
   hideLoad();
   toast(linked.length+' images uploaded!','ok');
@@ -1426,8 +1440,20 @@ function populateLocFilter(){
 // ══════════════════════════════════════════════════════════════
 //  CSV EXPORT
 // ══════════════════════════════════════════════════════════════
-function exportCSV(mode){
-  const recs=mode==='adm'?DB.records:myToday();
+async function exportCSV(mode){
+  if(mode==='op'){ showLoad('Refreshing...'); await loadRecords(); hideLoad(); }
+  let recs;
+  if(mode==='adm'){
+    const loc=document.getElementById('arec-loc')?.value||'';
+    const res=document.getElementById('arec-res')?.value||'';
+    const date=document.getElementById('arec-date')?.value||'';
+    const s=(document.getElementById('arec-search')?.value||'').toLowerCase();
+    recs=DB.records
+      .filter(r=>!loc||r.location_code===loc)
+      .filter(r=>!res||r.result===res)
+      .filter(r=>!date||String(r.scanned_at).substring(0,10)===date)
+      .filter(r=>!s||(r.awb||'').toLowerCase().includes(s)||(r.product_name||'').toLowerCase().includes(s));
+  } else { recs=myToday(); }
   const h=['AWB','Date','Location','Product','Category','Result','Tamper','Shoebox','Remarks','Operator','X-Ray Image','Label Image','Front Image','Back Image'];
   const rows=recs.map(r=>[r.awb,new Date(r.scanned_at).toLocaleString('en-IN'),r.location_code,r.product_name||'',r.product_category||'',r.result,r.tamper_status||'',r.shoe_box||'',(r.remarks||'').replace(/,/g,' '),r.operator_email||'',r.xray_image_url||'',r.label_image_url||'',r.front_image_url||'',r.back_image_url||'']);
   const csv=[h,...rows].map(r=>r.map(v=>'"'+v+'"').join(',')).join('\n');
